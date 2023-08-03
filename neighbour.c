@@ -28,6 +28,7 @@ THE SOFTWARE.
 #include <netinet/in.h>
 #include <time.h>
 #include <assert.h>
+#include <limits.h>
 
 #include "babeld.h"
 #include "util.h"
@@ -293,12 +294,27 @@ neighbour_rxcost(struct neighbour *neigh)
        ((ureach & 0xFFF0) == 0 || udelay >= 180000)) {
         return INFINITY;
     } else if((neigh->ifp->flags & IF_LQ)) {
-        int sreach =
-            ((reach & 0x8000) >> 2) +
-            ((reach & 0x4000) >> 1) +
-            (reach & 0x3FFF);
-        /* 0 <= sreach <= 0x7FFF */
-        int cost = (0x8000 * neigh->ifp->cost) / (sreach + 1);
+        /*
+         * ETX - Appendix 2.2 in the RFC.
+         *  RFC: https://www.rfc-editor.org/rfc/rfc8966.html#section-a.2.2
+         *  ETX: https://doi.org/10.1145/938985.939000
+         *
+         * rxcost represents the probabiliy that the ACK packet is successfully received
+         *
+         * here, we will compute the successfully receiving probability
+         */
+        int cost;
+        /* number of hellos I should receive and save in the hello history */
+        int shellos = MIN(neigh->hello.seqno, __builtin_popcount(USHRT_MAX));
+        /* number of the successfully received hellos
+           0 <= sreach <= shellos */
+        int sreach = __builtin_popcount(reach);
+        if (shellos <= 0 || sreach == 0) {
+            return INFINITY;
+        } else {
+            /* calculate: base_cost(neigh => us) / P(neigh => us) */
+            cost = neigh->ifp->cost * shellos / sreach;
+        }
         /* cost >= interface->cost */
         if(delay >= 40000)
             cost = (cost * (delay - 20000) + 10000) / 20000;
@@ -354,14 +370,19 @@ neighbour_cost(struct neighbour *neigh)
     if(!(neigh->ifp->flags & IF_LQ) || (a < 256 && b < 256)) {
         cost = a;
     } else {
-        /* a = 256/alpha, b = 256/beta, where alpha and beta are the expected
-           probabilities of a packet getting through in the direct and reverse
-           directions. */
-        a = MAX(a, 256);
-        b = MAX(b, 256);
-        /* 1/(alpha * beta), which is just plain ETX. */
-        /* Since a and b are capped to 16 bits, overflow is impossible. */
-        cost = (a * b + 128) >> 8;
+        /*
+         * ETX:
+         * a = peer sent value
+         *   = base_cost(us => neigh) / P(us => neigh)
+         * b = base_cost(neigh => us) / P(neigh => us)
+         *
+         * neighbour's cost should be:
+         * C = base_cost(us => neigh) / P(us => neigh) / P(neigh => us)
+         *   = a * b / cost(neigh => us)
+         */
+        /* in case b is smaller than base_cost(neigh => us)? */
+        b = MAX(b, neigh->ifp->cost);
+        cost = a * b / neigh->ifp->cost;
     }
 
     cost += neighbour_rttcost(neigh);
